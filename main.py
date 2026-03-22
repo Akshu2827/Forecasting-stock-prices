@@ -11,13 +11,13 @@ import matplotlib.pyplot as plt
 # ------------------------------
 # 1. Load and prepare data
 # ------------------------------
-ticker = "ASHOKLEY.NS"
+ticker = "INDHOTEL.NS"
 df_raw = yf.download(ticker, period="5y", auto_adjust=False)[["Adj Close"]]
 
 # Flatten multi-index columns
 df_raw.columns = df_raw.columns.get_level_values(0)
 
-# Create feature set: lags (odd numbers 1..9) and RSI
+
 df = df_raw.copy()
 for i in range(1, 10, 2):
     df[f'lag_{i}'] = df['Adj Close'].shift(i)
@@ -65,7 +65,6 @@ for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
     
     # Pipeline: scaling + linear regression
     pipeline = Pipeline([
-        ('scaler', StandardScaler()),
         ('model', LinearRegression())
     ])
     pipeline.fit(X_train, y_train)
