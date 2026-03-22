@@ -2,6 +2,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 
 # ------------------------------
@@ -10,10 +14,10 @@ import matplotlib.pyplot as plt
 ticker = "ASHOKLEY.NS"
 df_raw = yf.download(ticker, period="5y", auto_adjust=False)[["Adj Close"]]
 
-# Fix: Flatten multi-index columns to single level
+# Flatten multi-index columns
 df_raw.columns = df_raw.columns.get_level_values(0)
 
-# Now df_raw['Adj Close'] is a Series
+# Create feature set: lags (odd numbers 1..9) and RSI
 df = df_raw.copy()
 for i in range(1, 10, 2):
     df[f'lag_{i}'] = df['Adj Close'].shift(i)
@@ -34,99 +38,160 @@ df.dropna(inplace=True)
 X = df.drop('Adj Close', axis=1)
 y = df['Adj Close']
 
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import numpy as np
-
+# ------------------------------
+# 2. Define evaluation metrics
+# ------------------------------
 def evaluate(y_true, y_pred):
     return {
-    "mae" : mean_absolute_error(y_true, y_pred), 
-    "rmse" : np.sqrt(mean_squared_error(y_true, y_pred)), 
-    "mape" :(np.abs((y_true - y_pred) / y_true)).mean() * 100, 
-    "r2" : r2_score(y_true, y_pred)
+        "mae": mean_absolute_error(y_true, y_pred),
+        "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "mape": (np.abs((y_true - y_pred) / y_true)).mean() * 100,
+        "r2": r2_score(y_true, y_pred)
     }
 
+# ------------------------------
+# 3. Walk‑forward validation
+# ------------------------------
+n_splits = 5
+tscv = TimeSeriesSplit(n_splits=n_splits)
 
-split = int(len(df) * 0.5)
+fold_metrics = []
+fold_predictions = []  # store (y_test, y_pred) for later plots
 
-X_train, X_test = X.iloc[:split], X.iloc[split:]
-y_train, y_test = y.iloc[:split], y.iloc[split:]
+print("Walk‑forward validation results:")
+for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    
+    # Pipeline: scaling + linear regression
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', LinearRegression())
+    ])
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+    
+    metrics = evaluate(y_test, y_pred)
+    fold_metrics.append(metrics)
+    fold_predictions.append((y_test, y_pred))
+    
+    print(f"Fold {fold+1}: RMSE = {metrics['rmse']:.4f}, R² = {metrics['r2']:.4f}")
 
+# Average metrics across folds
+avg_metrics = {key: np.mean([m[key] for m in fold_metrics]) for key in fold_metrics[0]}
+print("\nAverage metrics across folds:")
+print(f"MAE: {avg_metrics['mae']:.4f}")
+print(f"RMSE: {avg_metrics['rmse']:.4f}")
+print(f"MAPE: {avg_metrics['mape']:.2f}%")
+print(f"R²: {avg_metrics['r2']:.4f}")
 
-from sklearn.linear_model import LinearRegression
+# ------------------------------
+# 4. Visualise predictions for each fold
+# ------------------------------
+fig, axes = plt.subplots(n_splits, 1, figsize=(12, 4*n_splits), sharex=True)
+if n_splits == 1:
+    axes = [axes]
 
-lr = LinearRegression()
-lr.fit(X_train, y_train)
-lr_pred = lr.predict(X_test)
+for i, (y_test, y_pred) in enumerate(fold_predictions):
+    ax = axes[i]
+    ax.plot(y_test.index, y_test.values, label='Actual', linewidth=2, color='blue')
+    ax.plot(y_test.index, y_pred, label='Predicted', linestyle='--', linewidth=2, color='orange')
+    ax.set_title(f'Fold {i+1} – Actual vs Predicted (Test period)')
+    ax.set_ylabel('Adjusted Close Price')
+    ax.legend()
+    ax.grid(True)
+    ax.tick_params(axis='x', rotation=45)
 
-lr_metrics = evaluate(y_test, lr_pred)
-
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(10, 5))
-
-# Plotting the index (Dates) against the values
-plt.plot(y_test.index, y_test.values, label='Actual Price', linewidth=2)
-plt.plot(y_test.index, lr_pred, label='Predicted Price', linestyle='--')
-
-plt.title(f'Stock {ticker}, Actual vs Predicted Closing Price (Linear Regression)')
 plt.xlabel('Date')
-plt.ylabel('Adjusted Close Price')
-plt.legend()
-plt.grid(True)
-
-plt.xticks(rotation=45)
-plt.tight_layout() 
-
+plt.tight_layout()
 plt.show()
 
-print(lr_metrics)
-print(X, "feature")
-print(y,"traget column")
+# Optional: summary bar chart of RMSE per fold
+plt.figure(figsize=(10, 5))
+rmse_vals = [m['rmse'] for m in fold_metrics]
+plt.bar(range(1, n_splits+1), rmse_vals, color='skyblue', edgecolor='black')
+plt.axhline(y=np.mean(rmse_vals), color='red', linestyle='--', label=f'Mean RMSE = {np.mean(rmse_vals):.4f}')
+plt.xlabel('Fold')
+plt.ylabel('RMSE')
+plt.title('RMSE per Walk‑forward Fold')
+plt.legend()
+plt.grid(True, axis='y')
+plt.tight_layout()
+plt.show()
 
 # ------------------------------
-# 2. Recursive prediction for next 5 days
+# 5. Train final model on all data for recursive forecasting
 # ------------------------------
-# Get full price history (original, all actual prices)
-prices = df_raw['Adj Close'].tolist()   # Now it's a Series -> .tolist() works
+# Use the same pipeline with scaling (fit on whole dataset)
+final_pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('model', LinearRegression())
+])
+final_pipeline.fit(X, y)  # train on all available data
+
+# ------------------------------
+# 6. Recursive prediction for next 5 days
+# ------------------------------
+# Full actual price history (for computing lags and RSI)
+prices = df_raw['Adj Close'].tolist()
 last_date = df_raw.index[-1]
-
 future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=5)
+
 predictions = []
+# Feature order must match training
+feature_columns = X.columns.tolist()
 
 for _ in range(5):
-    # Extract required lags from the current price list
+    # Ensure we have at least 9 prices (for lag_9)
+    if len(prices) < 9:
+        print("Error: Not enough historical prices for features.")
+        break
+
+    # Extract lags
     lag_1 = prices[-1]
     lag_3 = prices[-3]
     lag_5 = prices[-5]
     lag_7 = prices[-7]
     lag_9 = prices[-9]
 
-    # Compute RSI on the whole series of lag_1 values (price history)
-    lag1_series = pd.Series(prices)
-    rsi_val = compute_RSI(lag1_series).iloc[-1]
+    # Compute RSI on the full price series (including predicted ones)
+    price_series = pd.Series(prices)
+    rsi_val = compute_RSI(price_series).iloc[-1]
 
-    # Feature vector
-    features = np.array([[lag_1, lag_3, lag_5, lag_7, lag_9, rsi_val]])
+    # Build feature vector in correct order
+    feature_dict = {
+        'lag_1': lag_1,
+        'lag_3': lag_3,
+        'lag_5': lag_5,
+        'lag_7': lag_7,
+        'lag_9': lag_9,
+        'RSI': rsi_val
+    }
+    features = np.array([[feature_dict[col] for col in feature_columns]])
 
     # Predict next price
-    next_price = lr.predict(features)[0]
+    next_price = final_pipeline.predict(features)[0]
     predictions.append(next_price)
 
-    # Append predicted price to history for next iteration
+    # Append to history for next iteration
     prices.append(next_price)
 
 # Display results
-print("Next 5 trading day predictions:")
+print("\nNext 5 trading day predictions:")
 for date, price in zip(future_dates, predictions):
     print(f"{date.strftime('%Y-%m-%d')}: {price:.2f}")
 
-# Plot actual + predicted prices
-plt.figure(figsize=(10,5))
-plt.plot(df_raw.index[-30:], df_raw['Adj Close'].iloc[-30:], label='Actual (last 30 days)', color='blue')
-plt.plot(future_dates, predictions, 'ro--', label='Predicted (next 5 days)', markersize=8)
-plt.title(f'{ticker} - Actual and Forecasted Prices')
+# ------------------------------
+# 7. Plot last 30 actual days + 5‑day forecast
+# ------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(df_raw.index[-30:], df_raw['Adj Close'].iloc[-30:],
+         label='Actual (last 30 days)', color='blue', linewidth=2)
+plt.plot(future_dates, predictions, 'ro--', label='Predicted (next 5 days)',
+         markersize=8, linewidth=2)
+plt.title(f'{ticker} – Actual and 5‑Day Forecast')
 plt.xlabel('Date')
-plt.ylabel('Adjusted Close')
+plt.ylabel('Adjusted Close Price')
 plt.legend()
 plt.grid(True)
 plt.xticks(rotation=45)
